@@ -1,0 +1,17 @@
+/.venv/
+/venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+/.vscode/
+/.idea/
+.env
+.env.*
+/data/
+/data_*/
+/runs/
+*.pt
+*.pth
+*.ckpt
+Thumbs.db
+.DS_Store
