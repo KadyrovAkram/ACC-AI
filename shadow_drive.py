@@ -1,6 +1,7 @@
 """Log live ACC controls and model predictions without sending any inputs."""
 import argparse
 import csv
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 import time
@@ -13,7 +14,8 @@ from pyaccsharedmemory import accSharedMemory
 import torch
 
 from capture_cadence import CaptureCadence
-from train_imitation import CONTROLS, DrivingCNN, check_device, prepare_image
+from train_imitation import (CONTROLS, HISTORY_MAX_GAP_S, BrakeClassifier, DrivingCNN,
+                             check_device, prepare_image)
 
 
 def prepare_capture(screenshot):
@@ -29,7 +31,12 @@ def prepare_capture(screenshot):
 
 @torch.inference_mode()
 def predict(model, image, saved, device, speed_kmh):
-    tensor = prepare_image(image, tuple(saved["image_size"]), saved["road_crop"])
+    frames = (image,) if isinstance(image, Image.Image) else tuple(image)
+    frames = frames[-model.history_frames:]
+    if len(frames) != model.history_frames:
+        raise ValueError(f"This checkpoint requires {model.history_frames} consecutive frames.")
+    tensor = torch.cat([prepare_image(frame, tuple(saved["image_size"]), saved["road_crop"])
+                        for frame in frames])
     images = tensor.unsqueeze(0).to(device)
     speed = images.new_tensor([[speed_kmh]]) if model.speed_scale is not None else None
     return model(images, speed)[0].tolist()
@@ -37,9 +44,15 @@ def predict(model, image, saved, device, speed_kmh):
 
 def load_model(path, device):
     saved = torch.load(path, map_location=device, weights_only=True)
-    model = DrivingCNN(saved.get("speed_scale_kmh")).to(device).eval()
+    model = DrivingCNN(saved.get("speed_scale_kmh"), saved.get("history_frames", 1)).to(device).eval()
     model.load_state_dict(saved["model_state"])
     return model, saved
+
+
+@torch.inference_mode()
+def brake_score(model, image, saved, device):
+    tensor = prepare_image(image, tuple(saved["image_size"]), saved["road_crop"])
+    return model(tensor.unsqueeze(0).to(device)).sigmoid().item()
 
 
 def run(args):
@@ -50,16 +63,30 @@ def run(args):
         comparison = load_model(args.compare_checkpoint, device)
         print(f"Comparing {args.checkpoint} with {args.compare_checkpoint}")
 
+    required_history = max(model.history_frames, comparison[0].history_frames if comparison else 1)
+    if required_history > 1 and args.fps != 10:
+        raise SystemExit("Use --fps 10 with a frame-history checkpoint.")
+
+    brake_classifier = None
+    if args.brake_classifier:
+        brake_checkpoint = torch.load(args.brake_classifier, map_location=device, weights_only=True)
+        brake_classifier = BrakeClassifier().to(device).eval()
+        brake_classifier.load_state_dict(brake_checkpoint["model_state"])
+        print(f"Brake classifier: {args.brake_classifier} at cutoff {brake_checkpoint['threshold']:.3f}")
+
     # Initialize inference before the capture clock starts.
     warmup = Image.new("RGB", (640, 360))
-    predict(model, warmup, saved, device, 0.0)
+    predict(model, [warmup] * required_history, saved, device, 0.0)
     if comparison:
         other_model, other_saved = comparison
-        predict(other_model, warmup, other_saved, device, 0.0)
+        predict(other_model, [warmup] * required_history, other_saved, device, 0.0)
+
+    if brake_classifier is not None:
+        brake_score(brake_classifier, warmup, brake_checkpoint, device)
 
     folder = Path("runs/shadow")
     folder.mkdir(parents=True, exist_ok=True)
-    prefix = "shadow_compare" if comparison else "shadow"
+    prefix = "shadow_compare" if comparison or brake_classifier is not None else "shadow"
     log = folder / f"{prefix}_{datetime.now():%Y%m%d_%H%M%S_%f}.csv"
     print(f"Target capture rate: {args.fps} Hz.")
     print("Switch to ACC on your primary monitor. Capture starts in 5 seconds.")
@@ -67,6 +94,9 @@ def run(args):
     acc = accSharedMemory()
     cadence = CaptureCadence(args.fps, args.seconds)
     missing = 0
+    waiting_for_history = 0
+    history = deque(maxlen=required_history)
+    last_capture = None
     try:
         with MSS() as screen, log.open("x", newline="", encoding="utf-8") as file:
             writer = csv.writer(file)
@@ -76,6 +106,8 @@ def run(args):
             if comparison:
                 columns.extend(["comparison_latency_ms",
                                 *[f"comparison_{key}" for key in CONTROLS]])
+            if brake_classifier is not None:
+                columns.extend(["classifier_brake", "classifier_score", "classifier_latency_ms"])
             writer.writerow(columns)
             monitor = screen.primary_monitor
             for before in cadence:
@@ -85,18 +117,30 @@ def run(args):
                 telemetry = time.perf_counter()
                 if state is None:
                     missing += 1
+                    history.clear()
                 else:
                     car = state.Physics
                     image = prepare_capture(frame)
-                    guesses = predict(model, image, saved, device, car.speed_kmh)
+                    if last_capture is not None and capture - last_capture > HISTORY_MAX_GAP_S:
+                        history.clear()
+                    last_capture = capture
+                    history.append(image)
+                    if len(history) < required_history:
+                        waiting_for_history += 1
+                        continue
+                    guesses = predict(model, history, saved, device, car.speed_kmh)
                     ready = time.perf_counter()
                     row = [capture - cadence.start, 1000 * (telemetry - capture),
                            1000 * (ready - capture), car.speed_kmh,
                            car.steer_angle, car.gas, car.brake, *guesses]
                     if comparison:
                         other_model, other_saved = comparison
-                        other_guesses = predict(other_model, image, other_saved, device, car.speed_kmh)
+                        other_guesses = predict(other_model, history, other_saved, device, car.speed_kmh)
                         row.extend([1000 * (time.perf_counter() - capture), *other_guesses])
+                    if brake_classifier is not None:
+                        score = brake_score(brake_classifier, image, brake_checkpoint, device)
+                        row.extend([int(score >= brake_checkpoint["threshold"]), score,
+                                    1000 * (time.perf_counter() - capture)])
                     writer.writerow(row)
                     cadence.timestamps.append(capture)
                     if len(cadence.timestamps) % (5 * args.fps) == 0:
@@ -107,6 +151,8 @@ def run(args):
     finally:
         acc.close()
     print(f"Logged {len(cadence.timestamps)} frames, skipped {missing} without telemetry.")
+    if required_history > 1:
+        print(f"Skipped {waiting_for_history} frames while building consecutive history.")
     cadence.summary()
     print(f"Log: {log.resolve()}")
     if not cadence.timestamps:
@@ -120,6 +166,8 @@ def main():
     parser.add_argument("--checkpoint", type=Path, default=Path("runs/milestone5/best.pt"))
     parser.add_argument("--compare-checkpoint", type=Path,
                         help="Log a second model's predictions for the same frames.")
+    parser.add_argument("--brake-classifier", type=Path,
+                        help="Log a brake-only classifier alongside the driving model.")
     args = parser.parse_args()
     if args.seconds <= 0 or args.fps <= 0:
         parser.error("--seconds and --fps must be positive")

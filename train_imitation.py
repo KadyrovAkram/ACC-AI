@@ -18,8 +18,10 @@ IMAGE_SIZE = (192, 40)  # Width, height
 ROAD_CROP = (145 / 640, 100 / 360, 1.0, 198 / 360)  # Relative to the recorded view
 BRAKE_THRESHOLD = 0.05
 HARD_BRAKE_THRESHOLD = 0.5
+STRONG_STEER_THRESHOLD = 0.15
 SPEED_SCALE_KMH = 300.0
 SEED = 42
+HISTORY_MAX_GAP_S = 0.16
 
 
 @dataclass(frozen=True)
@@ -105,8 +107,18 @@ def load_image(path, size=IMAGE_SIZE, crop=ROAD_CROP):
 
 
 class DrivingDataset(Dataset):
-    def __init__(self, samples):
-        self.samples = samples
+    def __init__(self, samples, history_frames=1, sample_history=1):
+        self.windows = []
+        self.samples = []
+        self.cache = {} if sample_history > 1 else None
+        for index in range(sample_history - 1, len(samples)):
+            window = samples[index - sample_history + 1:index + 1]
+            if any(left.path.parent != right.path.parent or
+                   not 0 < right.time - left.time <= HISTORY_MAX_GAP_S
+                   for left, right in zip(window, window[1:])):
+                continue
+            self.windows.append(tuple(frame.path for frame in window[-history_frames:]))
+            self.samples.append(window[-1])
 
     def __len__(self):
         return len(self.samples)
@@ -115,13 +127,22 @@ class DrivingDataset(Dataset):
         sample = self.samples[index]
         controls = torch.tensor(sample.controls, dtype=torch.float32)
         speed = torch.tensor([sample.speed_kmh], dtype=torch.float32)
-        return load_image(sample.path), controls, speed
+        paths = self.windows[index]
+        if self.cache is None:
+            return load_image(paths[0]), controls, speed
+        images = []
+        for path in paths:
+            if path not in self.cache:
+                self.cache[path] = load_image(path).mul(255).round().byte()
+            images.append(self.cache[path])
+        return torch.cat(images).float().div_(255), controls, speed
 
 
 class DrivingCNN(nn.Module):
-    def __init__(self, speed_scale=None):
+    def __init__(self, speed_scale=None, history_frames=1):
         super().__init__()
         self.speed_scale = speed_scale
+        self.history_frames = history_frames
         self.features = nn.Sequential(
             nn.Conv2d(3, 16, 5, stride=2, padding=2),
             nn.ReLU(),
@@ -133,6 +154,16 @@ class DrivingCNN(nn.Module):
         )
         self.head = nn.Sequential(nn.Flatten(), nn.Linear(32 * 3 * 5 + int(speed_scale is not None), 64),
                                   nn.ReLU(), nn.Linear(64, 3))
+        if history_frames > 1:
+            # Start with the same current-frame model; learn the older channels from zero.
+            current = self.features[0]
+            with torch.random.fork_rng(devices=[]):
+                expanded = nn.Conv2d(3 * history_frames, 16, 5, stride=2, padding=2)
+            with torch.no_grad():
+                expanded.weight.zero_()
+                expanded.weight[:, -3:].copy_(current.weight)
+                expanded.bias.copy_(current.bias)
+            self.features[0] = expanded
 
     def forward(self, images, speed_kmh=None):
         features = self.features(images)
@@ -140,6 +171,15 @@ class DrivingCNN(nn.Module):
             features = torch.cat((features.flatten(1), speed_kmh / self.speed_scale), dim=1)
         raw = self.head(features)
         return torch.cat((raw[:, :1].tanh(), raw[:, 1:].sigmoid()), dim=1)
+
+
+class BrakeClassifier(DrivingCNN):
+    def __init__(self):
+        super().__init__()
+        self.head[-1] = nn.Linear(self.head[-1].in_features, 1)
+
+    def forward(self, images):
+        return self.head(self.features(images)).squeeze(1)
 
 
 def label_tensor(samples):
@@ -195,23 +235,32 @@ def show_metrics(name, predictions, targets):
 
 def train(args, device):
     torch.manual_seed(SEED)
-    paths = sorted(path for path in args.data.glob("vision_session_*") if path.is_dir())
-    if not paths:
-        raise ValueError(f"No vision_session_* directories in {args.data.resolve()}")
-    train_samples, val_samples = split_sessions([
-        read_session(path, use_speed=args.use_speed) for path in paths
-    ])
+    if args.train_stints:
+        train_samples = [sample for path in args.train_stints
+                         for sample in read_session(path, use_speed=args.use_speed)]
+        val_samples = read_session(args.validation_stint, use_speed=args.use_speed)
+    else:
+        paths = sorted(path for path in args.data.glob("vision_session_*") if path.is_dir())
+        if not paths:
+            raise ValueError(f"No vision_session_* directories in {args.data.resolve()}")
+        train_samples, val_samples = split_sessions([
+            read_session(path, use_speed=args.use_speed) for path in paths
+        ])
+    train_dataset = DrivingDataset(train_samples, args.history_frames, args.sample_history)
+    val_dataset = DrivingDataset(val_samples, args.history_frames, args.sample_history)
+    train_samples, val_samples = train_dataset.samples, val_dataset.samples
+    if len(train_samples) < 2 or len(val_samples) < 2:
+        raise ValueError("Need at least two valid frame windows on both sides of the split.")
     describe("Train", train_samples)
     describe("Validation", val_samples)
+    print(f"Model input: {args.history_frames} frame(s); anchor window: {args.sample_history} frame(s).")
 
-    train_loader = DataLoader(DrivingDataset(train_samples), batch_size=args.batch_size,
-                              shuffle=True, num_workers=0)
-    val_loader = DataLoader(DrivingDataset(val_samples), batch_size=args.batch_size,
-                            num_workers=0)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, num_workers=0)
     targets = label_tensor(val_samples)
     baseline = label_tensor(train_samples).median(dim=0).values
     speed_scale = SPEED_SCALE_KMH if args.use_speed else None
-    model = DrivingCNN(speed_scale).to(device)
+    model = DrivingCNN(speed_scale, args.history_frames).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     loss_fn = nn.SmoothL1Loss(beta=0.1, reduction="none")
     best_mae = math.inf
@@ -226,7 +275,9 @@ def train(args, device):
             errors = loss_fn(model(images.to(device), speed.to(device)), controls)
             hard_braking = controls[:, 2] >= HARD_BRAKE_THRESHOLD
             extra_brake_loss = errors[:, 2] * hard_braking * (args.hard_brake_weight - 1)
-            loss = (errors.sum(dim=1) + extra_brake_loss).mean() / len(CONTROLS)
+            strong_steering = controls[:, 0].abs() >= STRONG_STEER_THRESHOLD
+            extra_steer_loss = errors[:, 0] * strong_steering * (args.strong_steer_weight - 1)
+            loss = (errors.sum(dim=1) + extra_brake_loss + extra_steer_loss).mean() / len(CONTROLS)
             loss.backward()
             optimizer.step()
             total_loss += loss.detach() * images.size(0)
@@ -243,7 +294,9 @@ def train(args, device):
                 "epoch": epoch,
                 "validation_mae": val_mae,
                 "hard_brake_weight": args.hard_brake_weight,
+                "strong_steer_weight": args.strong_steer_weight,
                 "speed_scale_kmh": speed_scale,
+                "history_frames": args.history_frames,
                 "controls": list(CONTROLS),
                 "image_size": list(IMAGE_SIZE),
                 "road_crop": list(ROAD_CROP),
@@ -274,18 +327,40 @@ def main():
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--hard-brake-weight", type=float, default=1.0,
                         help="Loss multiplier for brake targets at or above 50 percent.")
+    parser.add_argument("--strong-steer-weight", type=float, default=1.0,
+                        help="Loss multiplier when absolute steering is at least 0.15.")
+    parser.add_argument("--train-stints", nargs="+", type=Path,
+                        help="Use these stints for training instead of the automatic split.")
+    parser.add_argument("--validation-stint", type=Path)
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check-gpu", action="store_true")
     mode.add_argument("--predict", type=Path, metavar="FRAME")
     parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--history-frames", type=int, choices=(1, 3), default=1)
+    parser.add_argument("--sample-history", type=int, choices=(1, 3),
+                        help="Require complete history even for a single-frame control run.")
+    parser.add_argument("--previous-frames", type=Path, nargs=2, metavar=("OLDEST", "PREVIOUS"),
+                        help="Two earlier frames for a three-frame prediction.")
     parser.add_argument("--use-speed", action="store_true", help="Train with recorded speed.")
     parser.add_argument("--speed-kmh", type=float, help="Current speed for a single-frame prediction.")
     args = parser.parse_args()
+    if args.sample_history is None:
+        args.sample_history = args.history_frames
+    if args.sample_history < args.history_frames:
+        parser.error("--sample-history must be at least --history-frames")
     if args.epochs < 1 or args.batch_size < 1:
         parser.error("--epochs and --batch-size must be positive")
     if not math.isfinite(args.hard_brake_weight) or args.hard_brake_weight < 1:
         parser.error("--hard-brake-weight must be finite and at least 1")
+    if not math.isfinite(args.strong_steer_weight) or args.strong_steer_weight < 1:
+        parser.error("--strong-steer-weight must be finite and at least 1")
+    if bool(args.train_stints) != bool(args.validation_stint):
+        parser.error("--train-stints and --validation-stint must be provided together")
+    if args.train_stints:
+        stints = [*args.train_stints, args.validation_stint]
+        if len({stint.resolve() for stint in stints}) != len(stints):
+            parser.error("Training and validation stint paths must be distinct")
     if args.predict and not args.checkpoint:
         parser.error("--predict requires --checkpoint")
     if args.check_gpu and args.device != "cuda":
@@ -299,9 +374,14 @@ def main():
         if speed_scale is not None and (args.speed_kmh is None or not math.isfinite(args.speed_kmh)):
             parser.error("This checkpoint requires a finite --speed-kmh.")
         speed = torch.tensor([[args.speed_kmh]], device=device) if speed_scale is not None else None
-        model = DrivingCNN(speed_scale).to(device).eval()
+        history_frames = saved.get("history_frames", 1)
+        paths = [*(args.previous_frames or []), args.predict]
+        if len(paths) != history_frames:
+            parser.error(f"This checkpoint requires {history_frames} frame(s).")
+        model = DrivingCNN(speed_scale, history_frames).to(device).eval()
         model.load_state_dict(saved["model_state"])
-        image = load_image(args.predict, tuple(saved["image_size"]), saved["road_crop"])
+        image = torch.cat([load_image(path, tuple(saved["image_size"]), saved["road_crop"])
+                           for path in paths])
         with torch.inference_mode():
             prediction = model(image.unsqueeze(0).to(device), speed)[0].tolist()
         print(dict(zip(saved["controls"], prediction)))
