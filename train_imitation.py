@@ -18,6 +18,7 @@ IMAGE_SIZE = (192, 40)  # Width, height
 ROAD_CROP = (145 / 640, 100 / 360, 1.0, 198 / 360)  # Relative to the recorded view
 BRAKE_THRESHOLD = 0.05
 HARD_BRAKE_THRESHOLD = 0.5
+STRONG_STEER_THRESHOLD = 0.15
 SPEED_SCALE_KMH = 300.0
 SEED = 42
 
@@ -195,19 +196,24 @@ def show_metrics(name, predictions, targets):
 
 def train(args, device):
     torch.manual_seed(SEED)
-    paths = sorted(path for path in args.data.glob("vision_session_*") if path.is_dir())
-    if not paths:
-        raise ValueError(f"No vision_session_* directories in {args.data.resolve()}")
-    train_samples, val_samples = split_sessions([
-        read_session(path, use_speed=args.use_speed) for path in paths
-    ])
+    if args.train_stints:
+        train_samples = [sample for path in args.train_stints
+                         for sample in read_session(path, use_speed=args.use_speed)]
+        val_samples = read_session(args.validation_stint, use_speed=args.use_speed)
+    else:
+        paths = sorted(path for path in args.data.glob("vision_session_*") if path.is_dir())
+        if not paths:
+            raise ValueError(f"No vision_session_* directories in {args.data.resolve()}")
+        train_samples, val_samples = split_sessions([
+            read_session(path, use_speed=args.use_speed) for path in paths
+        ])
+    if len(train_samples) < 2 or len(val_samples) < 2:
+        raise ValueError("Need at least two samples on both sides of the split.")
     describe("Train", train_samples)
     describe("Validation", val_samples)
 
-    train_loader = DataLoader(DrivingDataset(train_samples), batch_size=args.batch_size,
-                              shuffle=True, num_workers=0)
-    val_loader = DataLoader(DrivingDataset(val_samples), batch_size=args.batch_size,
-                            num_workers=0)
+    train_loader = DataLoader(DrivingDataset(train_samples), batch_size=args.batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(DrivingDataset(val_samples), batch_size=args.batch_size, num_workers=0)
     targets = label_tensor(val_samples)
     baseline = label_tensor(train_samples).median(dim=0).values
     speed_scale = SPEED_SCALE_KMH if args.use_speed else None
@@ -226,7 +232,9 @@ def train(args, device):
             errors = loss_fn(model(images.to(device), speed.to(device)), controls)
             hard_braking = controls[:, 2] >= HARD_BRAKE_THRESHOLD
             extra_brake_loss = errors[:, 2] * hard_braking * (args.hard_brake_weight - 1)
-            loss = (errors.sum(dim=1) + extra_brake_loss).mean() / len(CONTROLS)
+            strong_steering = controls[:, 0].abs() >= STRONG_STEER_THRESHOLD
+            extra_steer_loss = errors[:, 0] * strong_steering * (args.strong_steer_weight - 1)
+            loss = (errors.sum(dim=1) + extra_brake_loss + extra_steer_loss).mean() / len(CONTROLS)
             loss.backward()
             optimizer.step()
             total_loss += loss.detach() * images.size(0)
@@ -243,6 +251,7 @@ def train(args, device):
                 "epoch": epoch,
                 "validation_mae": val_mae,
                 "hard_brake_weight": args.hard_brake_weight,
+                "strong_steer_weight": args.strong_steer_weight,
                 "speed_scale_kmh": speed_scale,
                 "controls": list(CONTROLS),
                 "image_size": list(IMAGE_SIZE),
@@ -274,6 +283,11 @@ def main():
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--hard-brake-weight", type=float, default=1.0,
                         help="Loss multiplier for brake targets at or above 50 percent.")
+    parser.add_argument("--strong-steer-weight", type=float, default=1.0,
+                        help="Loss multiplier when absolute steering is at least 0.15.")
+    parser.add_argument("--train-stints", nargs="+", type=Path,
+                        help="Use these stints for training instead of the automatic split.")
+    parser.add_argument("--validation-stint", type=Path)
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check-gpu", action="store_true")
@@ -286,6 +300,14 @@ def main():
         parser.error("--epochs and --batch-size must be positive")
     if not math.isfinite(args.hard_brake_weight) or args.hard_brake_weight < 1:
         parser.error("--hard-brake-weight must be finite and at least 1")
+    if not math.isfinite(args.strong_steer_weight) or args.strong_steer_weight < 1:
+        parser.error("--strong-steer-weight must be finite and at least 1")
+    if bool(args.train_stints) != bool(args.validation_stint):
+        parser.error("--train-stints and --validation-stint must be provided together")
+    if args.train_stints:
+        stints = [*args.train_stints, args.validation_stint]
+        if len({stint.resolve() for stint in stints}) != len(stints):
+            parser.error("Training and validation stint paths must be distinct")
     if args.predict and not args.checkpoint:
         parser.error("--predict requires --checkpoint")
     if args.check_gpu and args.device != "cuda":
