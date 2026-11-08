@@ -281,6 +281,20 @@ class PedalFilter:
         return raw_pedal
 
 
+class CornerBrakeRelease:
+    """Coast after reaching a chosen speed in the current brake request."""
+    def __init__(self, release_speed):
+        self.release_speed = release_speed
+        self.released = False
+
+    def update(self, pedal, speed):
+        if pedal != "brake":
+            self.released = False
+        elif self.release_speed is not None and speed <= self.release_speed:
+            self.released = True
+        return None if self.released else pedal
+
+
 def run(args):
     keys = WindowsKeys(args.throttle_key, args.brake_key)
     device = check_device("cuda")
@@ -295,19 +309,22 @@ def run(args):
           f"F8 arms for up to {args.arm_seconds:g} s below {args.max_speed:g} km/h; F9 stops.")
     if args.brake_duty_cap is not None:
         print(f"Brake pulses enabled, up to {args.brake_duty_cap:.0%} key-down time.")
+    if args.brake_release_speed is not None:
+        print(f"Corner brake release at {args.brake_release_speed:g} km/h.")
     print("Switch to solo Practice, Hotlap, or Hotstint on the primary monitor. Ready in 5 seconds.")
     time.sleep(5)
     acc = accSharedMemory()
     previous_packet = None
     previous_capture = None
     pedal_filter = PedalFilter()
+    corner_release = CornerBrakeRelease(args.brake_release_speed)
     cadence = CaptureCadence(10, args.seconds)
     rejected = Counter()
     try:
         with MSS() as screen, log.open("x", newline="", encoding="utf-8") as file:
             writer = csv.writer(file)
             writer.writerow(["elapsed_s", "armed", "speed_kmh", "acc_throttle", "acc_brake",
-                             "predicted_throttle", "predicted_brake", "requested_pedal", "phase", "raw_pedal", "brake_duty"])
+                             "predicted_throttle", "predicted_brake", "requested_pedal", "phase", "raw_pedal", "brake_duty", "speed_release"])
             monitor = screen.primary_monitor
             worker.start()
             announced = False
@@ -317,6 +334,7 @@ def run(args):
                 hwnd = keys.acc_window()
                 if hwnd is None:
                     pedal_filter.reset()
+                    corner_release.update(None, 0)
                     issue = "ACC left the primary monitor or lost focus"
                     rejected[issue] += 1
                     guard.offer(None, 0, None, issue)
@@ -327,6 +345,7 @@ def run(args):
                 issue = telemetry_issue(state, args.max_speed)
                 if issue or keys.foreground() != hwnd:
                     pedal_filter.reset()
+                    corner_release.update(None, 0)
                     issue = issue or "ACC lost foreground focus"
                     rejected[issue.split(" (")[0]] += 1
                     guard.offer(None, 0, None, issue)
@@ -340,16 +359,18 @@ def run(args):
                 _, throttle, brake = predict(model, prepare_capture(frame), saved, device, car.speed_kmh)
                 if previous_capture is not None and captured - previous_capture > STALE_SECONDS:
                     pedal_filter.reset()
+                    corner_release.update(None, 0)
                 previous_capture = captured
                 raw_pedal = choose_pedal(throttle, brake)
-                pedal = pedal_filter.update(raw_pedal, brake, captured)
+                filtered = pedal_filter.update(raw_pedal, brake, captured)
+                pedal = corner_release.update(filtered, car.speed_kmh)
                 duty = brake_duty(pedal, brake, args.brake_duty_cap)
                 armed = guard.offer(hwnd, captured, pedal, duty=duty)
                 if not announced:
                     announced = True
                     print("Eligible ACC session found. Press F8 when ready.", flush=True)
                 writer.writerow([captured - cadence.start, int(armed), car.speed_kmh, car.gas,
-                                 car.brake, throttle, brake, pedal or "coast", "prediction", raw_pedal or "coast", duty])
+                                 car.brake, throttle, brake, pedal or "coast", "prediction", raw_pedal or "coast", duty, int(corner_release.released)])
 
             # The worker has released its key before setting stop. Keep logging
             # briefly so ACC can confirm that the pedal value actually fell.
@@ -362,7 +383,7 @@ def run(args):
                         continue
                     car = state.Physics
                     writer.writerow([sampled - cadence.start, 0, car.speed_kmh, car.gas,
-                                     car.brake, "", "", "", "after_release", "", 0.0])
+                                     car.brake, "", "", "", "after_release", "", 0.0, 0])
     except KeyboardInterrupt:
         print("Stopped from terminal.")
     finally:
@@ -387,7 +408,11 @@ def main():
     parser.add_argument("--brake-key")
     parser.add_argument("--brake-duty-cap", type=float,
                         help="Pulse the brake key using the model score, capped at this fraction (0–1).")
+    parser.add_argument("--brake-release-speed", type=float,
+                        help="Coast at or below this speed during the current brake request.")
     args = parser.parse_args()
+    if args.brake_release_speed is not None and not 0 < args.brake_release_speed < args.max_speed:
+        parser.error("--brake-release-speed must be positive and below --max-speed.")
     if args.brake_duty_cap is not None and not 0 < args.brake_duty_cap <= 1:
         parser.error("--brake-duty-cap must be in (0, 1].")
     if args.live and (not args.throttle_key or not args.brake_key):
